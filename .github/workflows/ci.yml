@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request: ~
+  workflow_dispatch: ~
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  security-checker:
+    name: security-checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: local_php_security_checker
+        uses: pozetroninc/github-action-get-latest-release@master
+        with:
+          repository: fabpot/local-php-security-checker
+          excludes: prerelease, draft
+      - run: |
+          curl -sS -L https://github.com/fabpot/local-php-security-checker/releases/download/${{ steps.local_php_security_checker.outputs.release }}/local-php-security-checker_linux_amd64 -o local-php-security-checker
+          chmod +x local-php-security-checker
+          ./local-php-security-checker
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/bake-action@v4
+        with:
+          pull: true
+          load: true
+          files: |
+            compose.yaml
+            compose.override.yaml
+          set: |
+            *.cache-from=type=gha,scope=${{github.ref}}
+            *.cache-from=type=gha,scope=refs/heads/main
+            *.cache-to=type=gha,scope=${{github.ref}},mode=max
+            *.tags=${{ github.sha }}
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  static-analysis:
+    name: static-analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+      - uses: "shivammathur/setup-php@2.30.5"
+        with:
+          coverage: "none"
+          php-version: "8.3"
+          ini-values: memory_limit=-1
+          tools: composer:v2
+      - run: |
+          composer validate --strict
+      - id: composer-cache
+        run: echo "composer_cache_dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      - uses: "actions/cache@v4.0.2"
+        with:
+          path: ${{ steps.composer-cache.outputs.composer_cache_dir }}
+          key: "php-8.3-composer-${{ hashFiles('**/composer.lock') }}"
+          restore-keys: "php-8.3-composer"
+      - run: |
+          composer install --no-interaction --no-progress
+          ./vendor/bin/php-cs-fixer check --config=.php-cs-fixer.dist.php -v --stop-on-violation --using-cache=no ./src/
+          ./vendor/bin/phpstan analyse
+          ./vendor/bin/phpmd ./src/ github cleancode,codesize,design,naming,unusedcode
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/bake-action@v4
+        with:
+          pull: true
+          load: true
+          files: |
+            compose.yaml
+            compose.override.yaml
+          set: |
+            *.cache-from=type=gha,scope=${{github.ref}}
+            *.cache-from=type=gha,scope=refs/heads/main
+            *.cache-to=type=gha,scope=${{github.ref}},mode=max
+      - run: |
+          docker compose up --wait --no-build      
+      - run: |
+          docker compose exec -T php bin/console -e test doctrine:database:create
+      # - run: |
+      #     docker compose exec -T php bin/console -e test doctrine:migrations:migrate --no-interaction
+      # - run: |
+      #     docker compose exec -T php bin/phpunit
+      # - run: |
+      #     docker compose exec -T php bin/console -e test doctrine:schema:validate
+      # - run: |
+      #     docker compose exec -T php sudo apt update 
+      #     docker compose exec -T php sudo apt install -y apache2-utils jq curl
+      #     docker compose exec -T php chmod +x wait-for-it.sh
+      #     docker compose exec -T php ./wait-for-it.sh localhost:80 --timeout=10 --strict -- echo "app is up running"
+      #     docker compose exec -T php bash -c "curl --silent --request GET --url https://localhost/ | egrep \"Symfony\""
+      #     for i in {1..100}; do
+      #     curl --request POST \
+      #       --url https://localhost/users \
+      #       --header 'Content-Type: application/json' \
+      #       --data "{ \"email\": \"user${i}@example.com\", \"name\": \"User ${i}\" }"
+      #     done
+      #     ab -n 1000 -c 50 https://localhost/users
+      #     curl --silent --request GET --url https://localhost/users | jq '.data | length' | egrep '^100$'
